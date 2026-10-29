@@ -1,5 +1,5 @@
 # ==========================================
-# ÉTAPE 1 : Dépendances de production (commune aux étapes test et production)
+# ÉTAPE 1 : Dépendances de production
 # ==========================================
 # Node 24 = version LTS active (Node 20 n'a plus de correctifs de sécurité depuis avril 2026)
 FROM node:24-alpine AS base

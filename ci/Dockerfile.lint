@@ -1,5 +1,5 @@
 # ==========================================
-# CI : Lint du backend (une image = un outil)
+# CI : Lint du backend
 # ==========================================
 FROM node:24-alpine
 

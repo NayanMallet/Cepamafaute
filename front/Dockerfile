@@ -20,9 +20,8 @@ RUN npm run build
 # image Nginx Alpine (20-30 Mo) pour servir les fichiers statiques de manière ultra-rapide
 FROM nginx:alpine AS production-stage
 
-# 3. Manipulation OS : Nettoyage de Nginx (supp fichiers HTML par défaut et configurations de bienvenue)
-# Suppression des fichiers HTML par défaut pour n'exposer que notre application
-RUN rm -rf /usr/share/nginx/html/* /etc/nginx/conf.d/default.conf
+# 3. Manipulation OS : suppression des pages HTML par défaut de Nginx pour n'exposer que notre application
+RUN rm -rf /usr/share/nginx/html/*
 
 # 4. Copie des assets compilés et de la configuration du proxy
 COPY --from=build-stage /app/dist /usr/share/nginx/html
