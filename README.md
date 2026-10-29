@@ -1,68 +1,207 @@
 # Cordialement - Traducteur Corporate par IA
 
-Architecture micro-services conteneurisée pour le déploiement d'un outil parodique de traduction d'entreprise, orchestrée via Docker Compose.
+Outil parodique qui traduit une pensée brute (« Ludovic tu me fais chier avec tes questions ») en message corporate, politiquement correct et subtilement passif-agressif (« Merci Ludovic pour ton intérêt, je reviens vers toi dès que mon emploi du temps le permettra »).
 
-## 🏗 Structure du Projet
+L'application est découpée en micro-services Docker orchestrés par Docker Compose : un front, une API, un reverse proxy, et deux conteneurs de CI (lint + tests) qui conditionnent le démarrage de l'API.
 
-L'infrastructure est segmentée en trois services isolés communiquant sur un réseau privé Docker (`bridge`). L'application permet à un utilisateur de saisir une pensée brute ou sous le coup de l'émotion, et de la traduire via IA en un message professionnel, politiquement correct et subtilement passif-agressif.
+## Démarrage rapide
 
-### 1. Front-end (Vue.js + Nginx Alpine) :
+```bash
+cp .env.example .env      # puis renseigner AI_API_KEY (optionnel)
+docker compose up --build -d
+```
 
-Application cliente générée via Vite (Vue 3, TypeScript, Tailwind CSS). L'image finale ne contient que les fichiers statiques compilés, servis par un serveur web léger. L'interface capture le texte brut saisi par l'utilisateur et affiche le résultat corporate.
+Ouvrir http://localhost:8080 (ou le port choisi dans `PROXY_PORT`).
 
-* **Choix de l'OS (Alpine)** : Nous utilisons `nginx:alpine` dans l'étape finale du multi-stage build. Alpine Linux réduit la taille de l'image à environ 20-30 Mo, accélérant drastiquement le déploiement par rapport à une image Debian classique.
-* **Multi-stage build** : L'image utilise d'abord un environnement Node pour compiler le TypeScript et le Vue.js, puis transfère uniquement le dossier `dist/` vers l'image Nginx. Le code source et les lourds répertoires `node_modules` ne se retrouvent pas en production.
-* **Manipulation OS (`rm -rf /usr/share/nginx/html/*`)** : Suppression de la page d'accueil par défaut de Nginx pour éviter les conflits et s'assurer que seuls nos fichiers métier sont servis.
+```bash
+curl -X POST http://localhost:8080/api/translate \
+     -H "Content-Type: application/json" \
+     -d '{"text":"Ludovic tu me fais chier avec tes questions"}'
+# {"original":"...","translated":"...","source":"ai"}
+```
 
-### 2. Back-end API (Node.js Alpine) :
+Sans clé IA, l'application fonctionne quand même : le backend répond avec une phrase corporate locale (`"source":"fallback"`).
 
-Point d'entrée pour la logique métier. Utilise Express.js pour réceptionner le texte brut, lui injecter un "System Prompt" strict (ex: "Tu es un expert en ressources humaines, traduis ce texte de manière diplomatique..."), et interroger une API externe d'Intelligence Artificielle (ex: Groq/OpenAI) de manière sécurisée.
+## Architecture
 
-* **Masquage de la clé API** : Le conteneur back-end est indispensable ici pour sécuriser l'appel à l'IA. Si l'appel était fait depuis le Front, la clé API serait exposée côté client.
-* **Choix de l'OS (Node Alpine)** : Image officielle allégée. Node.js est un choix pertinent ici pour gérer efficacement les requêtes HTTP asynchrones vers l'API externe sans bloquer le thread principal.
-* **adduser -S appuser** : Par défaut, Docker exécute les processus en tant que `root`. Nous créons un utilisateur système non privilégié (`appuser`) et limitons ses droits. En cas de faille, l'attaquant ne sera pas super-administrateur du conteneur.
-* **ENV PORT=3000** : Paramétrage dynamique. Au lieu de coder le port d'écoute "en dur" dans le fichier JavaScript, nous utilisons une variable d'environnement qui peut être écrasée au "run".
+```mermaid
+flowchart TB
+    user["Utilisateur (navigateur)"]
+    env[".env<br/>AI_API_KEY, ressources, port"]
+    ai["API IA externe<br/>(Groq / OpenAI / Claude)"]
 
-### 3. Web Proxy (Nginx Alpine) :
+    subgraph ci["CI - conteneurs éphémères, sans réseau"]
+        lint["lint<br/>ESLint<br/>./back monté :ro"]
+        test["test<br/>node --test<br/>fetch simulé"]
+        lint -- "exit 0" --> test
+    end
 
-Point d'entrée unique de notre cloud. Il intercepte le trafic et dispatche les requêtes selon les routes.
+    subgraph net["Réseau privé Docker cordialement-network (bridge)"]
+        proxy["proxy - Nginx<br/>seul port publié : 8080 → 80"]
+        front["frontend - Nginx + Vue 3<br/>port interne 80"]
+        back["backend - Node.js / Express<br/>port interne 3000"]
+        proxy -- "/ " --> front
+        proxy -- "/api" --> back
+    end
 
-* **Reverse Proxy** : Protège l'infrastructure interne. Seul ce conteneur expose un port (8080) vers la machine hôte. Le front et le back ne communiquent qu'en interne, isolant l'API d'un accès direct non désiré.
-* **Résolution DNS Docker** : La configuration Nginx utilise les noms de services (`http://backend:3000` et `http://frontend:80`) pour router le trafic. L'adresse IP des conteneurs est gérée automatiquement par le daemon Docker.
+    user -- "HTTP :8080" --> proxy
+    test -- "exit 0" --> back
+    env -. "variables au runtime" .-> back
+    back -- "HTTPS + clé API<br/>prompt construit côté serveur" --> ai
+```
 
-## 🛠 Spécificités Techniques & Optimisation
+Ordre de démarrage imposé par `depends_on` :
 
-* **Images Slim & Ressources** : L'utilisation d'images minimalistes et la limitation des ressources restent une excellente pratique de l'industrie pour densifier les serveurs cloud, réduire la surface d'attaque et accélérer l'intégration continue.
-* **0 Image Hub Pure** : Conformément aux exigences du projet, aucune image du Docker Hub n'est utilisée telle quelle[cite: 1]. Chacune dispose de son propre `Dockerfile` qui altère le comportement de base (création d'utilisateurs, modification de configurations OS, compilation de code)[cite: 2].
+1. `lint` doit se terminer avec le code 0.
+2. `test` démarre, et doit aussi se terminer avec le code 0.
+3. `backend` démarre, puis doit devenir `healthy` (`/api/health` répond 200). En parallèle, `frontend` démarre et doit devenir `healthy`.
+4. `proxy` démarre en dernier : il ne reçoit donc jamais de trafic vers un service pas encore prêt (pas de 502).
 
-## ⚙️ Orchestration et Arguments
+Pourquoi un backend ? Le navigateur ne doit jamais voir la clé de l'API IA. Le front envoie uniquement le texte brut ; c'est le backend qui construit le prompt et appelle l'IA. Le proxy est le seul conteneur exposé à l'hôte : le backend n'est joignable que par le réseau Docker interne, via la résolution DNS des noms de services (`http://backend:3000`).
 
-* **Arguments au Run (Variables d'environnement)**[cite: 2]:
-    * `PORT` : Injecté dans le conteneur backend via le Compose pour spécifier son port d'écoute interne.
-    * `AI_API_KEY` : Clé d'authentification pour le service d'IA. Elle est passée au *runtime* via le `docker-compose.yml`, évitant ainsi d'inscrire des secrets en dur dans le code source ou l'image Docker.
-    * `NODE_ENV=production` : Indique au moteur V8 de Node d'optimiser le cache.
+## Les images
 
-* **Gestion du SIGTERM (Arrêt propre)**[cite: 2]:
-    * L'instruction `init: true` est ajoutée à tous les services dans le `docker-compose.yml`. Cela enveloppe l'exécution (PID 1) avec `tini`, un processus d'initialisation léger.
-    * *Pourquoi ?* Node.js gère mal le PID 1 sous Docker et peut ignorer le signal `SIGTERM` envoyé par `docker stop`. L'utilisation de `init` garantit que le signal est intercepté et que le serveur Express ou Nginx se coupe proprement (terminant proprement une traduction en cours avant de se fermer), évitant d'attendre le timeout forcé (`SIGKILL`).
+Toutes les images partent d'une base officielle minimale et sont personnalisées par un `Dockerfile` (code, configuration, utilisateur, signal d'arrêt). Aucune image du Docker Hub n'est utilisée telle quelle.
 
-* **Limitation des ressources (Deploy/Limits)**[cite: 2]:
-    * Des quotas stricts ont été mis en place. Le Backend est limité à `0.5 CPU` et `128M` de RAM, tandis que le Proxy et le Frontend utilisent seulement `0.2 CPU` et `64M` de RAM. Cela garantit un comportement prédictible de l'orchestrateur.
+Le choix d'Alpine est le même partout : distribution d'environ 5 Mo, moins de paquets donc moins de failles potentielles, et des pulls plus rapides. Ses outils `busybox` (dont `wget`) sont déjà présents, ce qui permet les healthchecks sans rien installer.
 
-* **Ordre de démarrage (Depends_on & Healthcheck)**[cite: 2]:
-    * Le Reverse Proxy refuse de s'allumer tant que le Backend ne répond pas "200 OK" sur sa route `/api/health`. Cela évite qu'un utilisateur reçoive une erreur "502 Bad Gateway" si Nginx démarre plus vite que l'API.
+### 1. Backend - `back/Dockerfile` (`node:24-alpine`, 3 étapes)
 
-## 🚀 Déploiement et Test
+| Étape | Rôle |
+|---|---|
+| `base` | `npm ci --omit=dev` : installe uniquement `express`, à la version exacte du `package-lock.json`. Ensuite `npm cache clean --force` vide le cache npm, inutile à l'exécution. |
+| `test` | Ajoute `src/` et `test/` à `base`. Utilisée par le conteneur CI `test` : on teste avec exactement les dépendances livrées en production. |
+| `production` | Ajoute seulement `src/` à `base`. Les tests ne sont donc pas dans l'image livrée. |
 
-1.  **Lancement global (Build & Run en tâche de fond)** :
-    ```bash
-    # Nécessite de configurer la variable AI_API_KEY dans l'environnement de l'hôte
-    docker-compose up --build -d
-    ```
+- **Pourquoi Node 24** : c'est la version LTS active. Node 20 ne reçoit plus de correctifs de sécurité depuis avril 2026.
+- **Dépendances** : `express` est le serveur HTTP. L'appel à l'IA utilise le `fetch` natif de Node : aucune bibliothèque supplémentaire.
+- **Opérations sur l'OS** :
+  - `addgroup -S appgroup && adduser -S appuser -G appgroup` crée un utilisateur système sans mot de passe ni shell de connexion. Le processus ne tourne donc pas en `root` : en cas de faille dans l'API, l'attaquant n'a aucun droit d'administration dans le conteneur.
+  - `COPY --chown=appuser:appgroup` donne les fichiers à cet utilisateur dès la copie. On évite ainsi un `chown -R` après coup, qui dupliquerait tous les fichiers dans une couche supplémentaire.
+- **Port** : `EXPOSE 3000`. Ce n'est qu'une documentation : le port n'est pas publié sur l'hôte.
+- **Entrypoint** : `ENTRYPOINT ["node"]` + `CMD ["src/server.js"]`.
+  - La forme exec (tableau JSON) lance `node` directement, sans shell intermédiaire, pour que le processus reçoive le `SIGTERM`.
+  - On n'utilise pas `npm start`, car npm ne transmet pas correctement les signaux à node.
+  - `ENTRYPOINT` fixe l'exécutable et `CMD` le script, qui peut être remplacé au run sans rebuild.
 
-2.  **Test de communication** :
-    ```bash
-    curl -X POST http://localhost:8080/api/translate \
-         -H "Content-Type: application/json" \
-         -d '{"text":"Tu me fais chier avec tes questions"}'
-    ```
+### 2. Frontend - `front/Dockerfile` (multi-stage `node:24-alpine` → `nginx:alpine`)
+
+- **Étape de build** : `npm ci` installe Vue 3, Vite, TypeScript et Tailwind aux versions exactes du lockfile. `npm run build` lance `vue-tsc` (vérification des types) puis `vite build`.
+- **Étape finale** : seul le dossier `dist/` (fichiers statiques compilés) est copié dans Nginx. Le code source, `node_modules` et les outils de build restent dans l'étape intermédiaire : l'image finale pèse environ 93 Mo au lieu de plusieurs centaines.
+- **Opérations sur l'OS** : `rm -rf /usr/share/nginx/html/* /etc/nginx/conf.d/default.conf` supprime la page d'accueil et la configuration par défaut de Nginx. Seule notre application est servie, avec notre `nginx.conf` (routage SPA `try_files` et cache long des assets).
+- **Port** : `EXPOSE 80`.
+- **`STOPSIGNAL SIGQUIT`** : pour Nginx, `SIGTERM` déclenche un arrêt immédiat, alors que `SIGQUIT` déclenche un arrêt gracieux qui termine les requêtes en cours.
+- **Entrypoint** : `ENTRYPOINT ["nginx"]` + `CMD ["-g", "daemon off;"]`. Par défaut Nginx passe en arrière-plan ; le PID 1 se terminerait alors et Docker arrêterait le conteneur. `daemon off;` le garde au premier plan.
+
+### 3. Reverse proxy - `proxy/Dockerfile` (`nginx:alpine`)
+
+- **Opérations sur l'OS** : suppression de `default.conf`, remplacé par notre configuration de reverse proxy. `/api` est envoyé vers `backend:3000`, tout le reste vers `frontend:80`.
+- **Port** : `EXPOSE 80`, publié sur l'hôte par le compose (`PROXY_PORT`, 8080 par défaut).
+- **`STOPSIGNAL SIGQUIT`** et **entrypoint** : identiques au frontend, pour les mêmes raisons.
+
+### 4. Lint - `ci/Dockerfile.lint` (`node:24-alpine`)
+
+- **Dépendance** : `npm install -g eslint@10.13.0` est le seul outil de l'image (une image = un outil). La version est figée pour obtenir le même résultat sur toutes les machines.
+- **Pas de copie du code** : `./back` est monté en lecture seule (`:ro`) au run, donc le job de CI ne peut pas modifier le code qu'il vérifie.
+- **Règles** : `back/eslint.config.js` liste les règles explicitement (variables non déclarées ou inutilisées, code inatteignable, `===` obligatoire…), sans `import`. Le volume monté ne contient pas de `node_modules`, et ESLint n'en a pas besoin.
+- **Utilisateur** : `USER node` (utilisateur non-root déjà fourni par l'image Node).
+- **Entrypoint** : `ENTRYPOINT ["eslint"]` + `CMD ["."]`. Le conteneur se comporte comme une commande, et son code de sortie (0 = propre, 1 = erreur) est le verdict.
+
+### 5. Tests - étape `test` de `back/Dockerfile`
+
+- **Entrypoint** : `ENTRYPOINT ["node"]` + `CMD ["--test", "test/index.test.js"]`. On utilise le test runner intégré à Node : aucune dépendance de test à installer.
+- **Pas d'appel réel à l'IA** : les tests remplacent `fetch` par une fausse réponse (`t.mock.method`). Ils sont donc gratuits, déterministes et ne demandent pas de clé. Le compose coupe en plus le réseau du conteneur (`network_mode: none`).
+- **Ce qui est couvert** : healthcheck, mode fallback sans clé, réponse IA, bascule en fallback si l'IA est en erreur, texte manquant, texte trop long.
+
+## Arguments au run (docker compose)
+
+Toutes les valeurs viennent du fichier `.env` (modèle : `.env.example`). Le compose les injecte avec `${VARIABLE:-valeur par défaut}`, il fonctionne donc même sans `.env`.
+
+| Variable | Conteneur | Rôle | Défaut |
+|---|---|---|---|
+| `AI_API_KEY` | backend | Clé de l'API IA. Fournie au runtime uniquement, jamais inscrite dans une image ni commitée. Vide = mode fallback. | vide |
+| `AI_API_URL` | backend | Endpoint au format OpenAI « chat completions ». On change de fournisseur sans rebuild. | Groq |
+| `AI_MODEL` | backend | Modèle utilisé. | `llama-3.3-70b-versatile` |
+| `AI_TIMEOUT_MS` | backend | Délai max de l'appel IA. Il est inférieur aux 10 s du `docker stop`, pour qu'une requête bloquée ne provoque jamais de SIGKILL. | `8000` |
+| `PORT`, `NODE_ENV` | backend | Port d'écoute interne. `production` active les optimisations d'Express et masque les détails d'erreur. | `3000`, `production` |
+| `PROXY_PORT` | proxy | Port publié sur l'hôte (utile si 8080 est déjà pris). | `8080` |
+| `*_CPUS`, `*_MEMORY` | tous | Ressources allouées à chaque conteneur (voir ci-dessous). | voir tableau |
+
+Équivalent sans compose, par exemple pour le backend :
+
+```bash
+docker run -d --init --cpus 0.5 --memory 128m \
+  -e AI_API_KEY=... -e AI_API_URL=... -e AI_MODEL=... \
+  --network cordialement_cordialement-network --name backend cordialement-backend
+```
+
+## Limitation des ressources
+
+Les conteneurs partagent le CPU et la RAM de l'hôte. Sans limite, un seul conteneur qui s'emballe peut saturer la machine. Avec une limite, le dépassement de mémoire tue uniquement ce conteneur (code 137, OOM) et `restart: unless-stopped` le relance.
+
+| Conteneur | CPU | RAM | Justification |
+|---|---|---|---|
+| backend | 0.50 | 128M | Environ 21 Mo mesurés au repos (`docker stats`). La marge sert à absorber les requêtes simultanées en attente de l'IA. C'est le service le plus sollicité. |
+| frontend | 0.20 | 64M | Environ 9 Mo mesurés : Nginx ne fait que servir des fichiers statiques. |
+| proxy | 0.20 | 64M | Environ 9 Mo mesurés : Nginx ne fait que relayer des requêtes. |
+| lint | 0.50 | 256M | Pic court pendant l'analyse de tout le code, puis le conteneur s'arrête. |
+| test | 0.50 | 256M | Pic court (serveur Express + test runner), puis le conteneur s'arrête. |
+
+Vérification : `docker stats`.
+
+## Gestion du SIGTERM
+
+À l'arrêt (`docker compose stop`), Docker envoie le `STOPSIGNAL` au PID 1, attend 10 s, puis envoie `SIGKILL`.
+
+- **Backend** :
+  - `init: true` place `tini` en PID 1 ; il transmet les signaux à node et récupère les processus zombies.
+  - `server.js` intercepte `SIGTERM` et `SIGINT`, appelle `server.close()` (plus de nouvelles connexions, fin des requêtes en cours), puis `process.exit(0)`.
+  - Le timeout de l'appel IA (`AI_TIMEOUT_MS`) garantit que cette fermeture se fait avant les 10 s.
+- **Frontend et proxy** : `STOPSIGNAL SIGQUIT` pour l'arrêt gracieux de Nginx, plus `init: true`.
+
+Preuve par les codes de sortie (référence : [codes de sortie des conteneurs](https://komodor.com/learn/exit-codes-in-containers-and-kubernetes-the-complete-guide/)) :
+
+```bash
+docker compose stop
+docker inspect -f '{{.Name}} {{.State.ExitCode}}' cordialement-backend cordialement-frontend cordialement-proxy
+# exit 0 partout : arrêt propre en quelques secondes
+# 137 = tué par SIGKILL (timeout dépassé ou OOM), 143 = SIGTERM reçu mais non géré
+```
+
+## CI : lint et tests dans des conteneurs
+
+Chaque étape est un conteneur qui s'exécute une fois puis s'arrête (`restart: "no"`). Le contrat est le code de sortie : `depends_on: condition: service_completed_successfully` ne démarre l'étape suivante que si la précédente a terminé avec `0`. Un code qui ne passe pas le lint ou les tests n'est donc jamais démarré.
+
+On utilise Compose et non Swarm : Swarm est fait pour des services qui tournent en continu (il les relance et maintient N réplicas) et ignore `depends_on`. Des jobs de CI exécutés une fois, dans un ordre précis, correspondent au modèle de Compose.
+
+```bash
+docker compose run --rm lint      # relancer seulement le lint
+docker compose run --rm test      # relancer seulement les tests
+docker compose logs lint test     # lire le résultat du dernier pipeline
+```
+
+Démonstration : ajouter `const unused = 1;` dans `back/src/app.js`, puis lancer `docker compose up -d`. Le lint sort en `exit 1`, et `test`, `backend` et `proxy` restent à l'état `Created`.
+
+## Docker vs virtualisation classique
+
+Une machine virtuelle émule un matériel complet et démarre un système d'exploitation entier avec son propre noyau. Elle demande des minutes de démarrage et des Go de disque et de RAM. Un conteneur partage le noyau de l'hôte et n'isole que des processus, ce qui le rend bien plus léger :
+
+- les 3 services applicatifs démarrent en quelques secondes ;
+- au repos, ils consomment ensemble moins de 40 Mo de RAM ;
+- chaque image se reconstruit à l'identique sur n'importe quelle machine à partir de son `Dockerfile`.
+
+La contrepartie est une isolation plus faible qu'une VM. D'où les utilisateurs non-root, le réseau privé et l'exposition d'un seul port.
+
+## Arborescence
+
+```
+.
+├── back/                 API Node.js (Express) + tests + règles ESLint
+│   ├── src/services/     appel à l'API IA (prompt, timeout)
+│   └── src/data/         phrases du mode fallback
+├── front/                Vue 3 + TypeScript + Tailwind, servi par Nginx
+├── proxy/                Nginx reverse proxy (seul point d'entrée)
+├── ci/                   image de lint
+├── docker-compose.yml    orchestration + pipeline CI
+└── .env.example          arguments du run (copier en .env)
+```
