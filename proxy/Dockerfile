@@ -10,6 +10,9 @@ COPY default.conf /etc/nginx/conf.d/default.conf
 # 4. Exposition du port
 EXPOSE 80
 
-# 5. Lancement de Nginx au premier plan
+# 5. Signal d'arrêt : pour Nginx, SIGQUIT = arrêt gracieux (termine les requêtes en cours)
+STOPSIGNAL SIGQUIT
+
+# 6. Lancement de Nginx au premier plan
 ENTRYPOINT ["nginx"]
 CMD ["-g", "daemon off;"]

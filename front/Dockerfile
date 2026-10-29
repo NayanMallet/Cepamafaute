@@ -1,13 +1,14 @@
 # ==========================================
 # ÉTAPE 1 : Compilation du projet frontend (Build stage)
 # ==========================================
-# image légère Node 20 Alpine pour compiler les assets Vue 3 / TypeScript
-FROM node:20-alpine AS build-stage
+# image légère Node 24 Alpine (LTS active) pour compiler les assets Vue 3 / TypeScript
+FROM node:24-alpine AS build-stage
 
 # 1. Structure de dossiers et Dépendances
 WORKDIR /app
 COPY package*.json ./
-RUN npm install
+# npm ci installe exactement les versions du package-lock.json (build reproductible)
+RUN npm ci
 
 # 2. Copie des sources et compilation
 COPY . .
@@ -30,6 +31,9 @@ COPY nginx.conf /etc/nginx/conf.d/default.conf
 # 5. Exposition du port
 EXPOSE 80
 
-# 6. Entrypoint
+# 6. Signal d'arrêt : pour Nginx, SIGQUIT = arrêt gracieux (SIGTERM = arrêt immédiat)
+STOPSIGNAL SIGQUIT
+
+# 7. Entrypoint
 ENTRYPOINT ["nginx"]
 CMD ["-g", "daemon off;"]
