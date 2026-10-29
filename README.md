@@ -20,7 +20,7 @@ curl -X POST http://localhost:8080/api/translate \
 # {"original":"...","translated":"...","source":"ai"}
 ```
 
-Sans clé IA, l'application fonctionne quand même : le backend répond avec une phrase corporate locale (`"source":"fallback"`).
+Sans clé IA, ou si l'IA est indisponible (par exemple un quota gratuit dépassé, erreur 429), l'application fonctionne quand même : le backend répond avec une phrase corporate locale (`"source":"fallback"`).
 
 ## Architecture
 
@@ -121,7 +121,7 @@ Toutes les valeurs viennent du fichier `.env` (modèle : `.env.example`). Le com
 |---|---|---|---|
 | `AI_API_KEY` | backend | Clé de l'API IA. Fournie au runtime uniquement, jamais inscrite dans une image ni commitée. Vide = mode fallback. | vide |
 | `AI_API_URL` | backend | Endpoint au format OpenAI « chat completions ». On change de fournisseur sans rebuild. | Groq |
-| `AI_MODEL` | backend | Modèle utilisé. | `llama-3.3-70b-versatile` |
+| `AI_MODEL` | backend | Modèle utilisé. | `qwen/qwen3.8-27b` |
 | `AI_TIMEOUT_MS` | backend | Délai max de l'appel IA. Il est inférieur aux 10 s du `docker stop`, pour qu'une requête bloquée ne provoque jamais de SIGKILL. | `8000` |
 | `PORT`, `NODE_ENV` | backend | Port d'écoute interne. `production` active les optimisations d'Express et masque les détails d'erreur. | `3000`, `production` |
 | `PROXY_PORT` | proxy | Port publié sur l'hôte (utile si 8080 est déjà pris). | `8080` |
