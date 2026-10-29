@@ -1,0 +1,17 @@
+# ==========================================
+# CI : Lint du backend (une image = un outil)
+# ==========================================
+FROM node:24-alpine
+
+# 1. Seul outil installé : ESLint, version figée pour un résultat identique sur toutes les machines
+RUN npm install -g eslint@10.13.0 && npm cache clean --force
+
+# 2. Le code du backend est monté ici en lecture seule par le docker-compose (aucune copie dans l'image)
+WORKDIR /workspace
+
+# 3. Sécurité : utilisateur non-privilégié "node" fourni par l'image de base
+USER node
+
+# 4. Entrypoint : code de sortie 0 = code propre, 1 = erreur de lint (le pipeline s'arrête)
+ENTRYPOINT ["eslint"]
+CMD ["."]

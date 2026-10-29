@@ -1,7 +1,47 @@
+# Les ${VARIABLE:-défaut} sont remplacées par les valeurs du fichier .env (voir .env.example).
+# Pipeline au démarrage :  lint ──► test ──► backend ──► proxy
 services:
+  # CI 1 - Lint du code backend (s'exécute une fois puis s'arrête)
+  lint:
+    build:
+      context: ./ci
+      dockerfile: Dockerfile.lint
+    container_name: cordialement-lint
+    volumes:
+      # Code monté en lecture seule : le job de CI ne peut pas modifier ce qu'il vérifie
+      - ./back:/workspace:ro
+    # Aucun accès réseau : le lint n'a besoin de rien télécharger
+    network_mode: none
+    restart: "no"
+    deploy:
+      resources:
+        limits:
+          cpus: ${LINT_CPUS:-0.50}
+          memory: ${LINT_MEMORY:-256M}
+
+  # CI 2 - Tests du backend, construits depuis l'étape "test" du Dockerfile backend
+  test:
+    build:
+      context: ./back
+      target: test
+    container_name: cordialement-test
+    # Aucun accès réseau : garantit que les tests n'appellent jamais la vraie API IA
+    network_mode: none
+    restart: "no"
+    depends_on:
+      lint:
+        condition: service_completed_successfully
+    deploy:
+      resources:
+        limits:
+          cpus: ${TEST_CPUS:-0.50}
+          memory: ${TEST_MEMORY:-256M}
+
   # Microservice Backend - API Node.js
   backend:
-    build: ./back
+    build:
+      context: ./back
+      target: production
     container_name: cordialement-backend
 
     # Injecte le processus "tini" (PID 1) pour intercepter le signal d'arrêt (SIGTERM).
@@ -11,9 +51,18 @@ services:
     environment:
       - PORT=3000
       - NODE_ENV=production
+      # Secrets et réglages IA fournis au runtime uniquement (jamais inscrits dans l'image)
+      - AI_API_KEY=${AI_API_KEY:-}
+      - AI_API_URL=${AI_API_URL:-https://api.groq.com/openai/v1/chat/completions}
+      - AI_MODEL=${AI_MODEL:-llama-3.3-70b-versatile}
+      - AI_TIMEOUT_MS=${AI_TIMEOUT_MS:-8000}
     expose:
       # Ouvre le port spécifiquement sur le réseau privé Docker.
       - "3000"
+    depends_on:
+      # Seul un code qui passe le lint et les tests est démarré
+      test:
+        condition: service_completed_successfully
     healthcheck:
       # Lance un appel régulier (wget) pour vérifier si l'API est vivante.
       test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1:3000/api/health"]
@@ -24,8 +73,8 @@ services:
     deploy:
       resources:
         limits:
-          cpus: '0.50'
-          memory: 128M
+          cpus: ${BACKEND_CPUS:-0.50}
+          memory: ${BACKEND_MEMORY:-128M}
     networks:
       - cordialement-network
 
@@ -37,11 +86,17 @@ services:
     restart: unless-stopped
     expose:
       - "80"
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1:80/"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+      start_period: 3s
     deploy:
       resources:
         limits:
-          cpus: '0.20'
-          memory: 64M
+          cpus: ${FRONTEND_CPUS:-0.20}
+          memory: ${FRONTEND_MEMORY:-64M}
     networks:
       - cordialement-network
 
@@ -52,17 +107,17 @@ services:
     init: true
     restart: unless-stopped
     ports:
-      - "8080:80"
+      - "${PROXY_PORT:-8080}:80"
     depends_on:
       backend:
         condition: service_healthy
       frontend:
-        condition: service_started
+        condition: service_healthy
     deploy:
       resources:
         limits:
-          cpus: '0.20'
-          memory: 64M
+          cpus: ${PROXY_CPUS:-0.20}
+          memory: ${PROXY_MEMORY:-64M}
     networks:
       - cordialement-network
 
