@@ -57,6 +57,8 @@ Ordre de démarrage imposé par `depends_on` :
 3. `backend` démarre, puis doit devenir `healthy` (`/api/health` répond 200). En parallèle, `frontend` démarre et doit devenir `healthy`.
 4. `proxy` démarre en dernier : il ne reçoit donc jamais de trafic vers un service pas encore prêt (pas de 502).
 
+Les healthchecks testent toutes les 5 s, avec 3 essais avant de déclarer un service `unhealthy`. Le service est donc détecté prêt (ou en panne) en quelques secondes, sans surcharger les conteneurs.
+
 Pourquoi un backend ? Le navigateur ne doit jamais voir la clé de l'API IA. Le front envoie uniquement le texte brut ; c'est le backend qui construit le prompt et appelle l'IA. Le proxy est le seul conteneur exposé à l'hôte : le backend n'est joignable que par le réseau Docker interne, via la résolution DNS des noms de services (`http://backend:3000`).
 
 ## Les images
@@ -64,6 +66,11 @@ Pourquoi un backend ? Le navigateur ne doit jamais voir la clé de l'API IA. Le 
 Toutes les images partent d'une base officielle minimale et sont personnalisées par un `Dockerfile` (code, configuration, utilisateur, signal d'arrêt). Aucune image du Docker Hub n'est utilisée telle quelle.
 
 Le choix d'Alpine est le même partout : distribution d'environ 5 Mo, moins de paquets donc moins de failles potentielles, et des pulls plus rapides. Ses outils `busybox` (dont `wget`) sont déjà présents, ce qui permet les healthchecks sans rien installer.
+
+Deux choix communs à toutes les images :
+
+- **Aucun `ARG` de build** : tout ce qui varie (clé IA, modèle, port, ressources) est une variable d'environnement lue au run. On change la configuration sans reconstruire l'image.
+- **Un `.dockerignore` pour chaque image qui copie du code** (back, front, proxy) : `node_modules`, `.git` et les logs ne sont pas envoyés au build. Le contexte est plus léger, le build plus rapide, et les `node_modules` de la machine hôte ne viennent pas écraser ceux installés par `npm ci` dans l'image.
 
 ### 1. Backend - `back/Dockerfile` (`node:24-alpine`, 3 étapes)
 
@@ -86,22 +93,24 @@ Le choix d'Alpine est le même partout : distribution d'environ 5 Mo, moins de p
 
 ### 2. Frontend - `front/Dockerfile` (multi-stage `node:24-alpine` → `nginx:alpine`)
 
-- **Étape de build** : `npm ci` installe Vue 3, Vite, TypeScript et Tailwind aux versions exactes du lockfile. `npm run build` lance `vue-tsc` (vérification des types) puis `vite build`.
+- **Étape de build** : `npm ci` installe, aux versions exactes du lockfile, Vue 3 (framework), Vite (bundler), TypeScript et `vue-tsc` (typage), Tailwind avec PostCSS et Autoprefixer (CSS). Ces outils ne servent qu'à compiler, aucun n'arrive dans l'image finale. `npm run build` lance `vue-tsc` (vérification des types) puis `vite build`.
 - **Étape finale** : seul le dossier `dist/` (fichiers statiques compilés) est copié dans Nginx. Le code source, `node_modules` et les outils de build restent dans l'étape intermédiaire : l'image finale pèse environ 93 Mo au lieu de plusieurs centaines.
-- **Opérations sur l'OS** : `rm -rf /usr/share/nginx/html/* /etc/nginx/conf.d/default.conf` supprime la page d'accueil et la configuration par défaut de Nginx. Seule notre application est servie, avec notre `nginx.conf` (routage SPA `try_files` et cache long des assets).
+- **Opérations sur l'OS** : `rm -rf /usr/share/nginx/html/*` supprime les pages par défaut de Nginx (page d'accueil, page d'erreur) : seule notre application est servie. Notre `nginx.conf` remplace la configuration par défaut (routage SPA `try_files` et cache long des assets).
+- **Utilisateur** : pas d'utilisateur ajouté. Le processus maître de Nginx démarre en root uniquement pour ouvrir le port 80, puis les processus qui traitent les requêtes tournent sous l'utilisateur `nginx` déjà prévu par l'image.
 - **Port** : `EXPOSE 80`.
 - **`STOPSIGNAL SIGQUIT`** : pour Nginx, `SIGTERM` déclenche un arrêt immédiat, alors que `SIGQUIT` déclenche un arrêt gracieux qui termine les requêtes en cours.
 - **Entrypoint** : `ENTRYPOINT ["nginx"]` + `CMD ["-g", "daemon off;"]`. Par défaut Nginx passe en arrière-plan ; le PID 1 se terminerait alors et Docker arrêterait le conteneur. `daemon off;` le garde au premier plan.
 
 ### 3. Reverse proxy - `proxy/Dockerfile` (`nginx:alpine`)
 
-- **Opérations sur l'OS** : suppression de `default.conf`, remplacé par notre configuration de reverse proxy. `/api` est envoyé vers `backend:3000`, tout le reste vers `frontend:80`.
+- **Personnalisation** : notre `default.conf` remplace la configuration par défaut de Nginx. `/api` est envoyé vers `backend:3000`, tout le reste vers `frontend:80`. Aucun paquet n'est installé : Nginx suffit à faire du reverse proxy.
+- **Utilisateur** : même fonctionnement que le frontend (maître en root pour le port 80, requêtes traitées par l'utilisateur `nginx`).
 - **Port** : `EXPOSE 80`, publié sur l'hôte par le compose (`PROXY_PORT`, 8080 par défaut).
 - **`STOPSIGNAL SIGQUIT`** et **entrypoint** : identiques au frontend, pour les mêmes raisons.
 
 ### 4. Lint - `ci/Dockerfile.lint` (`node:24-alpine`)
 
-- **Dépendance** : `npm install -g eslint@10.13.0` est le seul outil de l'image (une image = un outil). La version est figée pour obtenir le même résultat sur toutes les machines.
+- **Dépendance** : `npm install -g eslint@10.13.0` est le seul outil de l'image (une image = un outil). La version est figée pour obtenir le même résultat sur toutes les machines. `npm cache clean --force` supprime ensuite le cache de téléchargement, inutile dans l'image.
 - **Pas de copie du code** : `./back` est monté en lecture seule (`:ro`) au run, donc le job de CI ne peut pas modifier le code qu'il vérifie.
 - **Règles** : `back/eslint.config.js` liste les règles explicitement (variables non déclarées ou inutilisées, code inatteignable, `===` obligatoire…), sans `import`. Le volume monté ne contient pas de `node_modules`, et ESLint n'en a pas besoin.
 - **Utilisateur** : `USER node` (utilisateur non-root déjà fourni par l'image Node).
@@ -172,8 +181,6 @@ docker inspect -f '{{.Name}} {{.State.ExitCode}}' cordialement-backend cordialem
 
 Chaque étape est un conteneur qui s'exécute une fois puis s'arrête (`restart: "no"`). Le contrat est le code de sortie : `depends_on: condition: service_completed_successfully` ne démarre l'étape suivante que si la précédente a terminé avec `0`. Un code qui ne passe pas le lint ou les tests n'est donc jamais démarré.
 
-On utilise Compose et non Swarm : Swarm est fait pour des services qui tournent en continu (il les relance et maintient N réplicas) et ignore `depends_on`. Des jobs de CI exécutés une fois, dans un ordre précis, correspondent au modèle de Compose.
-
 ```bash
 docker compose run --rm lint      # relancer seulement le lint
 docker compose run --rm test      # relancer seulement les tests
@@ -181,6 +188,18 @@ docker compose logs lint test     # lire le résultat du dernier pipeline
 ```
 
 Démonstration : ajouter `const unused = 1;` dans `back/src/app.js`, puis lancer `docker compose up -d`. Le lint sort en `exit 1`, et `test`, `backend` et `proxy` restent à l'état `Created`.
+
+## Pourquoi Docker Compose et pas Docker Swarm
+
+La consigne demande 2 conteneurs parmi : scaling, lint, test. Nous avons choisi lint et test, et donc Compose plutôt que Swarm :
+
+- **Un seul hôte.** Swarm sert à répartir des conteneurs sur un cluster de plusieurs machines. Notre projet tourne sur une seule machine, ce qui correspond au rôle de Compose.
+- **Pas de besoin de scaling.** Le trafic d'un outil parodique ne justifie pas plusieurs répliques. Et le vrai goulot est l'API IA externe : ajouter des répliques du backend n'accélère pas Groq, et consommerait plus vite le quota gratuit.
+- **Swarm ne sait pas exécuter une CI.** Il redémarre les conteneurs qui s'arrêtent, pour maintenir N répliques en vie, et il ignore `depends_on`. Nos jobs de lint et de test doivent au contraire s'exécuter une fois, dans l'ordre, et s'arrêter : c'est le modèle de Compose (`service_completed_successfully`).
+- **Swarm ignore `build`.** Il faudrait construire chaque image à l'avance et la pousser dans un registry. C'est une étape et un service de plus, sans bénéfice pour ce projet.
+- **Swarm n'a pas d'autoscaling.** Il faudrait un conteneur supplémentaire qui surveille le CPU et lance `docker service scale`, comme dans l'exemple du cours.
+
+Si le projet devait un jour servir beaucoup d'utilisateurs sur plusieurs serveurs, on garderait la CI dans Compose et on déploierait les services applicatifs (`frontend`, `backend`, `proxy`) avec `docker stack deploy`.
 
 ## Docker vs virtualisation classique
 
